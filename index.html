@@ -1,0 +1,535 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Straight Banking System (BDT)</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Load Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, getDoc, setDoc, updateDoc, onSnapshot, collection, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // IMPORTANT: Use the provided global variables
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        // --- GLOBAL STATE & FIREBASE SETUP ---
+        setLogLevel('debug');
+        const app = initializeApp(firebaseConfig);
+        const db = getFirestore(app);
+        const auth = getAuth(app);
+        let userId = null;
+        let isAuthReady = false;
+
+        // Interest Rates based on Bangladesh market (Simulated Annual Rates)
+        const RATES = {
+            SAVINGS_ANNUAL: 0.035, // 3.5% p.a.
+            FD_ANNUAL: 0.090,      // 9.0% p.a.
+            LOAN_ANNUAL: 0.120     // 12.0% p.a.
+        };
+
+        const BANK_DATA_PATH = (uid) => `artifacts/${appId}/users/${uid}/bank_data/user_account`;
+
+        // Default data structure for a new user
+        const DEFAULT_DATA = {
+            balance: 10000.00, // Starting balance for simulation
+            fdAmount: 0.00,
+            fdMaturityTimestamp: null,
+            fdMaturityMonths: 0,
+            loanAmount: 0.00,
+            lastInterestCalculationTimestamp: Date.now(),
+        };
+
+        // UI elements
+        const ui = {
+            balanceDisplay: document.getElementById('balance-display'),
+            userIdDisplay: document.getElementById('user-id-display'),
+            fdAmountDisplay: document.getElementById('fd-amount-display'),
+            fdMaturityDisplay: document.getElementById('fd-maturity-display'),
+            loanAmountDisplay: document.getElementById('loan-amount-display'),
+            messageBox: document.getElementById('message-box'),
+            loanEligibilityDisplay: document.getElementById('loan-eligibility-display'),
+        };
+
+        let currentData = { ...DEFAULT_DATA };
+        
+        // --- UTILITY FUNCTIONS ---
+        const formatTk = (amount) => `Tk ${parseFloat(amount).toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ',')}`;
+        const formatPercent = (rate) => (rate * 100).toFixed(2) + '%';
+        const showMessage = (message, type = 'success') => {
+            ui.messageBox.innerHTML = message;
+            ui.messageBox.className = `p-3 rounded-xl mb-4 text-center transition-all ${
+                type === 'success' ? 'bg-green-100 text-green-800' : 
+                type === 'error' ? 'bg-red-100 text-red-800' :
+                'bg-blue-100 text-blue-800'
+            }`;
+        };
+        
+        // --- FINANCIAL LOGIC ---
+
+        /**
+         * Simulates daily interest calculation for Savings and Loan.
+         * Compounded daily.
+         * @param {Object} data - Current user data
+         * @returns {Object} Updated data
+         */
+        const applyDailyInterest = (data) => {
+            const now = Date.now();
+            const lastCalc = data.lastInterestCalculationTimestamp || now;
+            
+            // Calculate elapsed days
+            const MS_PER_DAY = 24 * 60 * 60 * 1000;
+            const daysElapsed = Math.floor((now - lastCalc) / MS_PER_DAY);
+            
+            if (daysElapsed < 1) return data; // No full day elapsed
+
+            let updatedBalance = data.balance;
+            let updatedLoan = data.loanAmount;
+            let totalSavingsInterest = 0;
+            let totalLoanInterest = 0;
+
+            const DAILY_SAVINGS_RATE = RATES.SAVINGS_ANNUAL / 365;
+            const DAILY_LOAN_RATE = RATES.LOAN_ANNUAL / 365;
+
+            // Simple daily compounding simulation
+            for (let i = 0; i < daysElapsed; i++) {
+                // Savings Interest (applied daily to the balance)
+                const savingsInterest = updatedBalance * DAILY_SAVINGS_RATE;
+                updatedBalance += savingsInterest;
+                totalSavingsInterest += savingsInterest;
+
+                // Loan Interest (applied daily to the loan amount)
+                const loanInterest = updatedLoan * DAILY_LOAN_RATE;
+                updatedLoan += loanInterest;
+                totalLoanInterest += loanInterest;
+            }
+
+            // Check for FD maturity
+            let fdMaturityMessage = '';
+            let updatedFdAmount = data.fdAmount;
+            let updatedFdMaturityTimestamp = data.fdMaturityTimestamp;
+            let updatedFdMaturityMonths = data.fdMaturityMonths;
+            
+            if (data.fdAmount > 0 && data.fdMaturityTimestamp && now >= data.fdMaturityTimestamp) {
+                const totalFdMonths = data.fdMaturityMonths;
+                const totalYears = totalFdMonths / 12;
+                
+                // Calculate total simple interest for the FD tenure
+                const fdInterestEarned = data.fdAmount * RATES.FD_ANNUAL * totalYears;
+                updatedBalance += (data.fdAmount + fdInterestEarned);
+                
+                fdMaturityMessage = `Your ${totalFdMonths}-month Fixed Deposit of ${formatTk(data.fdAmount)} has matured! You earned ${formatTk(fdInterestEarned)} in interest. Total ${formatTk(data.fdAmount + fdInterestEarned)} credited to your Savings Account.`;
+                
+                updatedFdAmount = 0.00;
+                updatedFdMaturityTimestamp = null;
+                updatedFdMaturityMonths = 0;
+            }
+
+
+            const updateObject = {
+                balance: parseFloat(updatedBalance.toFixed(2)),
+                loanAmount: parseFloat(updatedLoan.toFixed(2)),
+                fdAmount: parseFloat(updatedFdAmount.toFixed(2)),
+                fdMaturityTimestamp: updatedFdMaturityTimestamp,
+                fdMaturityMonths: updatedFdMaturityMonths,
+                lastInterestCalculationTimestamp: now,
+            };
+
+            // Only update if changes occurred
+            if (daysElapsed > 0 || fdMaturityMessage) {
+                 // Push update to Firestore
+                updateFirestore(updateObject);
+                let interestMessage = '';
+                if (daysElapsed > 0) {
+                    interestMessage = `Interest Applied! Savings earned ${formatTk(totalSavingsInterest.toFixed(2))}. Loan accrued ${formatTk(totalLoanInterest.toFixed(2))}.`;
+                }
+
+                // If interest applied or FD matured, show a combined message
+                if (fdMaturityMessage) {
+                    showMessage(fdMaturityMessage + (daysElapsed > 0 ? `<br/>${interestMessage}` : ''), 'info');
+                } else if (daysElapsed > 0) {
+                     showMessage(interestMessage, 'info');
+                }
+            }
+
+            return updateObject;
+        };
+
+        // --- FIREBASE DATA HANDLING ---
+
+        const updateFirestore = async (data) => {
+            if (!userId) return showMessage('Authentication not ready.', 'error');
+            try {
+                const docRef = doc(db, BANK_DATA_PATH(userId));
+                await setDoc(docRef, data, { merge: true });
+            } catch (e) {
+                console.error("Error updating document: ", e);
+                showMessage(`Error processing transaction: ${e.message}`, 'error');
+            }
+        };
+
+        const renderUI = (data) => {
+            currentData = data;
+            const assets = data.balance + data.fdAmount;
+            const maxLoan = assets * 2; // Loan Eligibility: 2x total assets
+            const loanEligible = data.loanAmount === 0; // Can only take one loan at a time
+
+            // 1. Account Summary
+            ui.balanceDisplay.textContent = formatTk(data.balance);
+            ui.loanEligibilityDisplay.textContent = formatTk(maxLoan);
+            
+            // 2. FD Status
+            ui.fdAmountDisplay.textContent = formatTk(data.fdAmount);
+            if (data.fdAmount > 0 && data.fdMaturityTimestamp) {
+                const maturityDate = new Date(data.fdMaturityTimestamp).toLocaleDateString();
+                ui.fdMaturityDisplay.textContent = `${data.fdMaturityMonths} months (Matures: ${maturityDate})`;
+                ui.fdMaturityDisplay.classList.add('text-yellow-600');
+            } else {
+                ui.fdMaturityDisplay.textContent = 'None Active';
+                ui.fdMaturityDisplay.classList.remove('text-yellow-600');
+            }
+
+            // 3. Loan Status
+            ui.loanAmountDisplay.textContent = formatTk(data.loanAmount);
+            if (data.loanAmount > 0) {
+                ui.loanAmountDisplay.classList.add('text-red-600');
+                document.getElementById('loan-section').classList.remove('hidden');
+                document.getElementById('loan-form').classList.add('hidden');
+            } else {
+                 ui.loanAmountDisplay.classList.remove('text-red-600');
+                 document.getElementById('loan-section').classList.add('hidden');
+                 document.getElementById('loan-form').classList.remove('hidden');
+            }
+        };
+
+        const setupSnapshotListener = () => {
+            if (!userId) return;
+            const docRef = doc(db, BANK_DATA_PATH(userId));
+            
+            // Use onSnapshot for real-time updates
+            onSnapshot(docRef, async (docSnap) => {
+                let data = DEFAULT_DATA;
+                if (docSnap.exists()) {
+                    // Load existing data
+                    data = docSnap.data();
+                } else {
+                    // First time user, create default data
+                    await setDoc(docRef, DEFAULT_DATA);
+                    data = DEFAULT_DATA;
+                }
+
+                // Apply any overdue interest and check FD maturity
+                const updatedData = applyDailyInterest(data);
+                
+                renderUI(updatedData);
+            }, (error) => {
+                console.error("Firestore listen error:", error);
+                showMessage(`Could not connect to database: ${error.message}`, 'error');
+            });
+        };
+
+        // --- AUTHENTICATION AND INITIALIZATION ---
+
+        onAuthStateChanged(auth, (user) => {
+            isAuthReady = true;
+            if (user) {
+                userId = user.uid;
+                ui.userIdDisplay.textContent = userId;
+                setupSnapshotListener();
+            } else {
+                showMessage("Authentication failed. Please try refreshing.", 'error');
+            }
+        });
+
+        // Try to sign in with custom token or anonymously
+        const initAuth = async () => {
+            try {
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+            } catch (error) {
+                console.error("Auth error:", error);
+                showMessage(`Authentication failed: ${error.message}`, 'error');
+            }
+        };
+
+        // --- TRANSACTION HANDLERS ---
+
+        window.handleTransaction = (type) => {
+            const amountInput = document.getElementById(type + '-amount');
+            let amount = parseFloat(amountInput.value);
+            amountInput.value = ''; // Clear input
+
+            if (isNaN(amount) || amount <= 0) {
+                return showMessage('Please enter a valid amount.', 'error');
+            }
+            if (amount > 1000000) {
+                 return showMessage('Max transaction limit is Tk 1,000,000 per attempt.', 'error');
+            }
+
+            let newBalance = currentData.balance;
+            let message = '';
+            let updateNeeded = false;
+
+            if (type === 'deposit') {
+                newBalance += amount;
+                message = `Successfully deposited ${formatTk(amount)}.`;
+                updateNeeded = true;
+            } else if (type === 'withdraw') {
+                if (amount > newBalance) {
+                    return showMessage(`Insufficient funds. Available balance: ${formatTk(newBalance)}.`, 'error');
+                }
+                newBalance -= amount;
+                message = `Successfully withdrew ${formatTk(amount)}.`;
+                updateNeeded = true;
+            }
+
+            if (updateNeeded) {
+                updateFirestore({ balance: parseFloat(newBalance.toFixed(2)) });
+                showMessage(message, 'success');
+            }
+        };
+
+        window.handleOpenFD = () => {
+            const fdAmountInput = document.getElementById('fd-initial-amount');
+            const fdMonthsInput = document.getElementById('fd-months');
+            
+            let amount = parseFloat(fdAmountInput.value);
+            let months = parseInt(fdMonthsInput.value);
+
+            if (isNaN(amount) || amount <= 0 || amount < 1000) {
+                return showMessage('FD amount must be at least Tk 1,000.', 'error');
+            }
+            if (isNaN(months) || months < 3 || months > 60) {
+                return showMessage('FD tenure must be between 3 and 60 months.', 'error');
+            }
+
+            if (currentData.fdAmount > 0) {
+                return showMessage('You already have an active Fixed Deposit. Wait for maturity or contact the bank.', 'error');
+            }
+            
+            if (amount > currentData.balance) {
+                return showMessage('Insufficient savings balance to open FD.', 'error');
+            }
+
+            const maturityDate = new Date();
+            maturityDate.setMonth(maturityDate.getMonth() + months);
+
+            const newBalance = currentData.balance - amount;
+
+            updateFirestore({
+                balance: parseFloat(newBalance.toFixed(2)),
+                fdAmount: parseFloat(amount.toFixed(2)),
+                fdMaturityTimestamp: maturityDate.getTime(),
+                fdMaturityMonths: months
+            });
+            showMessage(`Fixed Deposit of ${formatTk(amount)} opened successfully for ${months} months at ${formatPercent(RATES.FD_ANNUAL)}.`, 'success');
+            fdAmountInput.value = '';
+        };
+
+        window.handleTakeLoan = () => {
+             const loanAmountInput = document.getElementById('loan-initial-amount');
+             let amount = parseFloat(loanAmountInput.value);
+
+             const assets = currentData.balance + currentData.fdAmount;
+             const maxLoan = assets * 2;
+             
+             if (isNaN(amount) || amount <= 0 || amount < 1000) {
+                 return showMessage('Loan amount must be at least Tk 1,000.', 'error');
+             }
+             if (currentData.loanAmount > 0) {
+                 return showMessage('You must repay your existing loan before taking a new one.', 'error');
+             }
+             if (amount > maxLoan) {
+                 return showMessage(`Loan request denied. Max eligible loan based on assets (${formatTk(assets)}) is ${formatTk(maxLoan)}.`, 'error');
+             }
+             
+             const newBalance = currentData.balance + amount;
+             
+             updateFirestore({
+                 balance: parseFloat(newBalance.toFixed(2)),
+                 loanAmount: parseFloat(amount.toFixed(2)),
+                 lastInterestCalculationTimestamp: Date.now() // Reset calc date to start loan interest immediately
+             });
+             showMessage(`Loan of ${formatTk(amount)} approved and credited to your Savings Account at ${formatPercent(RATES.LOAN_ANNUAL)} interest.`, 'success');
+             loanAmountInput.value = '';
+        };
+
+        window.handleRepayLoan = () => {
+            const loan = currentData.loanAmount;
+            const balance = currentData.balance;
+
+            if (loan <= 0) {
+                return showMessage('You do not have an active loan to repay.', 'error');
+            }
+
+            if (balance < loan) {
+                return showMessage(`Insufficient savings balance to repay the full loan of ${formatTk(loan)}. Please deposit more money.`, 'error');
+            }
+
+            const repaymentAmount = loan;
+            const newBalance = balance - repaymentAmount;
+
+            updateFirestore({
+                balance: parseFloat(newBalance.toFixed(2)),
+                loanAmount: 0.00,
+            });
+            showMessage(`Loan of ${formatTk(repaymentAmount)} successfully repaid! Your account is now debt-free.`, 'success');
+        };
+
+        // Initialize on load
+        window.addEventListener('load', initAuth);
+
+    </script>
+
+    <style>
+        /* Custom styles for professional look */
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f7f9fc;
+        }
+        .card {
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+            border: 1px solid #e2e8f0;
+        }
+        .input-group input, .input-group button, .input-group select {
+            border-radius: 0.5rem; /* rounded-xl */
+        }
+        .input-group input:focus {
+            ring: 2px;
+            ring-offset: 2px;
+            ring-blue-500;
+            border-color: #3b82f6;
+        }
+    </style>
+</head>
+<body class="p-4 md:p-8">
+    <div class="max-w-4xl mx-auto">
+        <header class="text-center mb-8">
+            <h1 class="text-4xl font-bold text-blue-800">Bank Game </h1>
+            <p class="text-gray-500 mt-1">Straight Banking Simulation for Bangladesh (BDT)</p>
+             <p class="text-xs text-gray-400 mt-2">
+                User ID: <span id="user-id-display" class="font-mono text-xs">...</span> (for persistence)
+            </p>
+        </header>
+
+        <!-- Message Box -->
+        <div id="message-box" class="hidden"></div>
+        
+        <!-- Account Summary -->
+        <div class="card bg-white p-6 rounded-2xl mb-8">
+            <h2 class="text-2xl font-semibold mb-4 text-blue-700">Account Summary</h2>
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-4 text-center">
+                <div class="p-4 bg-green-50 rounded-xl shadow-inner border border-green-200">
+                    <p class="text-sm text-green-700 font-medium">Savings Balance</p>
+                    <p id="balance-display" class="text-3xl font-bold text-green-900 mt-1">Tk 0.00</p>
+                    <p class="text-xs text-gray-500 mt-1">Interest Rate: 3.5% p.a.</p>
+                </div>
+                 <div class="p-4 bg-yellow-50 rounded-xl shadow-inner border border-yellow-200">
+                    <p class="text-sm text-yellow-700 font-medium">Fixed Deposit (FD)</p>
+                    <p id="fd-amount-display" class="text-3xl font-bold text-yellow-900 mt-1">Tk 0.00</p>
+                    <p id="fd-maturity-display" class="text-xs text-gray-500 mt-1">None Active</p>
+                </div>
+                <div class="p-4 bg-red-50 rounded-xl shadow-inner border border-red-200">
+                    <p class="text-sm text-red-700 font-medium">Active Loan</p>
+                    <p id="loan-amount-display" class="text-3xl font-bold text-red-900 mt-1">Tk 0.00</p>
+                    <p class="text-xs text-gray-500 mt-1">Interest Rate: 12.0% p.a.</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Transaction Section -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-8 mb-8">
+            <!-- Deposit/Withdrawal -->
+            <div class="card bg-white p-6 rounded-2xl">
+                <h2 class="text-2xl font-semibold mb-4 text-blue-700">Deposit & Withdrawal</h2>
+                
+                <!-- Deposit Form -->
+                <div class="mb-6 input-group">
+                    <label for="deposit-amount" class="block text-sm font-medium text-gray-700 mb-2">Deposit Amount (Tk)</label>
+                    <div class="flex space-x-2">
+                        <input type="number" id="deposit-amount" placeholder="e.g., 5000" class="flex-grow p-3 border border-gray-300 focus:outline-none" min="1" step="0.01">
+                        <button onclick="handleTransaction('deposit')" class="bg-green-600 hover:bg-green-700 text-white font-semibold py-3 px-6 transition duration-150 shadow-md">Deposit</button>
+                    </div>
+                </div>
+
+                <!-- Withdrawal Form -->
+                <div class="input-group">
+                    <label for="withdraw-amount" class="block text-sm font-medium text-gray-700 mb-2">Withdrawal Amount (Tk)</label>
+                    <div class="flex space-x-2">
+                        <input type="number" id="withdraw-amount" placeholder="e.g., 1500" class="flex-grow p-3 border border-gray-300 focus:outline-none" min="1" step="0.01">
+                        <button onclick="handleTransaction('withdraw')" class="bg-red-600 hover:bg-red-700 text-white font-semibold py-3 px-6 transition duration-150 shadow-md">Withdraw</button>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Fixed Deposit (FD) -->
+            <div class="card bg-white p-6 rounded-2xl">
+                <h2 class="text-2xl font-semibold mb-4 text-blue-700">Open Fixed Deposit (FD)</h2>
+                <p class="text-sm text-gray-600 mb-4">Current Annual Rate: 9.00%</p>
+                
+                <div class="space-y-4 input-group">
+                    <div>
+                        <label for="fd-initial-amount" class="block text-sm font-medium text-gray-700 mb-2">FD Amount (Minimum Tk 1,000)</label>
+                        <input type="number" id="fd-initial-amount" placeholder="e.g., 20000" class="w-full p-3 border border-gray-300 focus:outline-none" min="1000" step="1000">
+                    </div>
+                    <div>
+                        <label for="fd-months" class="block text-sm font-medium text-gray-700 mb-2">FD Tenure (Months)</label>
+                        <select id="fd-months" class="w-full p-3 border border-gray-300 focus:outline-none">
+                            <option value="3">3 Months</option>
+                            <option value="6">6 Months</option>
+                            <option value="12" selected>12 Months</option>
+                            <option value="24">24 Months</option>
+                            <option value="36">36 Months</option>
+                        </select>
+                    </div>
+                    <button onclick="handleOpenFD()" class="w-full bg-yellow-600 hover:bg-yellow-700 text-white font-semibold py-3 px-6 transition duration-150 shadow-md">Open FD</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Loan Section -->
+        <div class="card bg-white p-6 rounded-2xl">
+             <h2 class="text-2xl font-semibold mb-4 text-blue-700">Loan Management</h2>
+            
+            <div class="mb-4 p-4 bg-blue-50 rounded-xl border border-blue-200">
+                <p class="text-sm text-blue-700 font-medium">
+                    Loan Eligibility: Maximum loan is 2x your total assets (Savings + FD).
+                </p>
+                <p class="text-xl font-bold text-blue-900 mt-1">
+                    Max Eligible Loan: <span id="loan-eligibility-display" class="text-blue-600">Tk 0.00</span>
+                </p>
+            </div>
+            
+            <!-- Repay Loan Section (Visible when loan is active) -->
+            <div id="loan-section" class="space-y-4 hidden">
+                <h3 class="text-xl font-semibold text-red-700">Repay Loan</h3>
+                <p class="text-gray-600">You must repay the full outstanding amount, including accrued interest, in a single transaction.</p>
+                <button onclick="handleRepayLoan()" class="w-full bg-red-600 hover:bg-red-700 text-white font-semibold py-3 px-6 transition duration-150 shadow-md">
+                    Repay Full Loan (<span id="repay-amount-display"></span>)
+                </button>
+            </div>
+
+            <!-- Take Loan Form (Visible when no loan is active) -->
+            <div id="loan-form" class="space-y-4 input-group">
+                <h3 class="text-xl font-semibold text-green-700">Take a New Loan</h3>
+                 <div>
+                    <label for="loan-initial-amount" class="block text-sm font-medium text-gray-700 mb-2">Loan Amount (Max: 2x Assets)</label>
+                    <div class="flex space-x-2">
+                        <input type="number" id="loan-initial-amount" placeholder="e.g., 50000" class="flex-grow p-3 border border-gray-300 focus:outline-none" min="1000" step="1000">
+                        <button onclick="handleTakeLoan()" class="bg-blue-600 hover:bg-blue-700 text-white font-semibold py-3 px-6 transition duration-150 shadow-md">Get Loan</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+    </div>
+</body>
+</html>
